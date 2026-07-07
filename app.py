@@ -1,167 +1,94 @@
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from typing import Optional
-import uuid
 import time
-import base64
-
-app = FastAPI()
-
-# -----------------------------
-# Enable CORS
-# -----------------------------
-from fastapi.middleware.cors import CORSMiddleware
+import uuid
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -----------------------------
-# Fixed catalog of 45 orders
-# -----------------------------
-
-TOTAL_ORDERS = 45
-
-catalog = [
-    {
-        "id": i,
-        "item": f"Item {i}"
-    }
-    for i in range(1, TOTAL_ORDERS + 1)
-]
-
-# -----------------------------
-# Idempotency storage
-# -----------------------------
-
-idempotency_store = {}
-
-# -----------------------------
-# Rate limiting storage
-# -----------------------------
-
-RATE_LIMIT = 20
+T = 45
+R = 20
 WINDOW = 10
 
-client_requests = {}
+orders_catalog = [{"id": i, "name": f"Order {i}"} for i in range(1, T + 1)]
+idempotency_store = {}
+rate_store = {}
 
-
-# -----------------------------
-# Rate limit helper
-# -----------------------------
+class OrderCreate(BaseModel):
+    item: Optional[str] = "sample"
 
 def check_rate_limit(client_id: str):
     now = time.time()
+    window_start = now - WINDOW
+    timestamps = rate_store.get(client_id, [])
+    timestamps = [ts for ts in timestamps if ts >= window_start]
 
-    if client_id not in client_requests:
-        client_requests[client_id] = []
-
-    timestamps = client_requests[client_id]
-
-    timestamps[:] = [
-        t for t in timestamps
-        if now - t < WINDOW
-    ]
-
-    if len(timestamps) >= RATE_LIMIT:
-
-        retry = WINDOW - (now - timestamps[0])
-
+    if len(timestamps) >= R:
+        retry_after = max(1, int(WINDOW - (now - min(timestamps))))
         raise HTTPException(
             status_code=429,
             detail="Rate limit exceeded",
-            headers={
-                "Retry-After": str(int(retry) + 1)
-            },
+            headers={"Retry-After": str(retry_after)},
         )
 
     timestamps.append(now)
-
-
-# -----------------------------
-# POST /orders
-# -----------------------------
+    rate_store[client_id] = timestamps
 
 @app.post("/orders", status_code=201)
 def create_order(
-    response: Response,
-    idempotency_key: str = Header(..., alias="Idempotency-Key"),
-    client_id: str = Header(..., alias="X-Client-Id"),
+    payload: OrderCreate,
+    request: Request,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    x_client_id: Optional[str] = Header(default="anonymous", alias="X-Client-Id"),
 ):
+    check_rate_limit(x_client_id)
 
-    check_rate_limit(client_id)
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail="Idempotency-Key header required")
 
     if idempotency_key in idempotency_store:
         return idempotency_store[idempotency_key]
 
     order = {
         "id": str(uuid.uuid4()),
-        "status": "created"
+        "item": payload.item,
+        "status": "created",
     }
-
     idempotency_store[idempotency_key] = order
-
     return order
-
-
-# -----------------------------
-# Cursor encode
-# -----------------------------
-
-def encode_cursor(index: int):
-
-    return base64.b64encode(
-        str(index).encode()
-    ).decode()
-
-
-def decode_cursor(cursor: Optional[str]):
-
-    if not cursor:
-        return 0
-
-    try:
-        return int(
-            base64.b64decode(cursor).decode()
-        )
-
-    except:
-        return 0
-
-
-# -----------------------------
-# GET /orders
-# -----------------------------
-
-@app.get("/")
-def home():
-    return {"message":"API running"}
 
 @app.get("/orders")
 def list_orders(
     limit: int = 10,
     cursor: Optional[str] = None,
-    x_client_id: str = Header(..., alias="X-Client-Id"),
+    x_client_id: Optional[str] = Header(default="anonymous", alias="X-Client-Id"),
 ):
-
     check_rate_limit(x_client_id)
 
-    start = decode_cursor(cursor)
+    limit = max(1, min(limit, 45))
 
-    end = min(start + limit, TOTAL_ORDERS)
+    start_index = 0
+    if cursor:
+        try:
+            last_seen = int(cursor)
+            start_index = last_seen
+        except ValueError:
+            start_index = 0
 
-    items = catalog[start:end]
+    items = orders_catalog[start_index:start_index + limit]
 
     next_cursor = None
-
-    if end < TOTAL_ORDERS:
-        next_cursor = encode_cursor(end)
+    if start_index + limit < len(orders_catalog):
+        next_cursor = str(items[-1]["id"])
 
     return {
         "items": items,
