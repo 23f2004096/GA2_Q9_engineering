@@ -139,6 +139,10 @@ def decode_cursor(cursor: Optional[str]):
 # GET /orders
 # -----------------------------
 
+@app.get("/")
+def home():
+    return {"message":"API running"}
+
 @app.get("/orders")
 def list_orders(
     limit: int = 10,
